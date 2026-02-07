@@ -482,9 +482,32 @@ static inline __poll_t select_poll_one(int fd, poll_table *wait, unsigned long i
 
 static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec64 *end_time)
 {
+	// fds, 指向fd_set_bits结构提，包含了用户传入的fd_set的in/out/ex以及结果res_in/res_out/res_ex
+	
+	// in 用户关心哪些fd可读
+	// out 用户关心哪些fd可写
+	// ex 用户关心哪些fd有异常事件
+
+	// res_in 内核返回哪些fd可读
+	// res_out 内核返回哪些fd可写
+	// res_ex 内核返回哪些fd有异常事件
+	
+	// end_time，指向用户传入的超时时间，如果用户没有传入，则为NULL
 	ktime_t expire, *to = NULL;
 	struct poll_wqueues table;
 	poll_table *wait;
+
+	
+// /*
+//  * Do not touch the structure directly, use the access function
+//  * poll_requested_events() instead.
+//  */
+// typedef struct poll_table_struct {
+// 	poll_queue_proc _qproc;
+// 	__poll_t _key;
+// } poll_table;
+
+
 	int retval, i, timed_out = 0;
 	u64 slack = 0;
 	__poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0;
@@ -509,7 +532,7 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 		slack = select_estimate_accuracy(end_time);
 
 	retval = 0;
-	for (;;) {
+	for (;;) { // "无限循环"，直到有事件发生，超时，或者被信号打断
 		unsigned long *rinp, *routp, *rexp, *inp, *outp, *exp;
 		bool can_busy_loop = false;
 
@@ -520,7 +543,9 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 			unsigned long in, out, ex, all_bits, bit = 1, j;
 			unsigned long res_in = 0, res_out = 0, res_ex = 0;
 			__poll_t mask;
-
+			
+			// 一组一组的检查位图，一下取出BITS_PER_LONG个fd，全空就继续下一组
+			// 这里就是小林coding说的循环遍历，需要位图全扫描
 			in = *inp++; out = *outp++; ex = *exp++;
 			all_bits = in | out | ex;
 			if (all_bits == 0) {
@@ -533,19 +558,28 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 					break;
 				if (!(bit & all_bits))
 					continue;
+				// 调用select_poll_one来检查fd为i的这个文件是否有事件发生
+				// wait为等待队列，用来注册等待事件发生时唤醒当前进程
+				// 这里select_poll_one是水平触发的本质原因，
+				// 因为它每次都检查当前fd的状态，而不是等到事件发生时才检查。
 				mask = select_poll_one(i, wait, in, out, bit,
 						       busy_flag);
+
+				// mask与各类事件与，检查事件类型。
 				if ((mask & POLLIN_SET) && (in & bit)) {
+					// 读事件
 					res_in |= bit;
 					retval++;
 					wait->_qproc = NULL;
 				}
 				if ((mask & POLLOUT_SET) && (out & bit)) {
+					// 写事件
 					res_out |= bit;
 					retval++;
 					wait->_qproc = NULL;
 				}
 				if ((mask & POLLEX_SET) && (ex & bit)) {
+					// 异常事件
 					res_ex |= bit;
 					retval++;
 					wait->_qproc = NULL;
@@ -563,12 +597,15 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 					can_busy_loop = true;
 
 			}
+			// 将结果写入结果位图
 			if (res_in)
 				*rinp = res_in;
 			if (res_out)
 				*routp = res_out;
 			if (res_ex)
 				*rexp = res_ex;
+			// 这里会检查当前cpu是否需要调度。
+			// 整个linux有1533次cond_resched()，让人感叹啊
 			cond_resched();
 		}
 		wait->_qproc = NULL;
@@ -599,7 +636,9 @@ static noinline_for_stack int do_select(int n, fd_set_bits *fds, struct timespec
 			expire = timespec64_to_ktime(*end_time);
 			to = &expire;
 		}
-
+		
+		// 如果没有就绪事件放生，就挂起自己，等待事件发生
+		// 就会继续下一个循环，检查事件。
 		if (!poll_schedule_timeout(&table, TASK_INTERRUPTIBLE,
 					   to, slack))
 			timed_out = 1;
