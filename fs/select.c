@@ -764,6 +764,9 @@ SYSCALL_DEFINE5(select, int, n, fd_set __user *, inp, fd_set __user *, outp,
 	return kern_select(n, inp, outp, exp, tvp);
 }
 
+// p stands for "precise" or "posix"
+// pselect是posix标准定义的函数
+// 支持在调用时修改信号掩码
 static long do_pselect(int n, fd_set __user *inp, fd_set __user *outp,
 		       fd_set __user *exp, void __user *tsp,
 		       const sigset_t __user *sigmask, size_t sigsetsize,
