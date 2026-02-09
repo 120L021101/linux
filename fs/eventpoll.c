@@ -45,8 +45,12 @@
  * There are three level of locking required by epoll :
  *
  * 1) epnested_mutex (mutex)
+ * 		全局锁，用于保护epoll文件描述符之间的嵌套关系，防止死锁。
  * 2) ep->mtx (mutex)
+ * 		局部锁，用于保护每个eventpoll实例的内部数据结构，如事件列表和文件描述符树。
  * 3) ep->lock (spinlock)
+ * 		局部锁，用于保护事件列表和溢出列表的访问，确保在中断上下文中安全地操作这些数据结构。
+ * 		持有自旋锁时不允许有任何可能导致睡眠的操作，这是内核级别的要求。
  *
  * The acquire order is the one listed above, from 1 to 3.
  * We need a spinlock (ep->lock) because we manipulate objects
@@ -389,6 +393,9 @@ static inline struct epitem *ep_item_from_wait(wait_queue_entry_t *p)
  */
 static inline int ep_events_available(struct eventpoll *ep)
 {
+	// list_empty_careful快速判断是否非空
+	// READ_ONCE 内核宏，规避并发时由编译器优化引入的问题
+	// ep->ovflist是溢出队列，如果epoll正在处理rdllist，新到达的事件会暂存在ovflist
 	return !list_empty_careful(&ep->rdllist) ||
 		READ_ONCE(ep->ovflist) != EP_UNACTIVE_PTR;
 }
@@ -1249,10 +1256,14 @@ static int ep_poll_callback(wait_queue_entry_t *wait, unsigned mode, int sync, v
 	int pwake = 0;
 	struct epitem *epi = ep_item_from_wait(wait);
 	struct eventpoll *ep = epi->ep;
+	// 设备上报的ready bits转换成poll事件位
 	__poll_t pollflags = key_to_poll(key);
 	unsigned long flags;
 	int ewake = 0;
 
+
+	// irq上下文：cpu正在处理硬中断处理程序，
+	// 如果在这个irq上下文中，代码运行在中断栈上，不能再被中断，不能睡眠，不能持有可能睡眠的锁
 	spin_lock_irqsave(&ep->lock, flags);
 
 	ep_set_busy_poll_napi_id(epi);
@@ -1262,7 +1273,7 @@ static int ep_poll_callback(wait_queue_entry_t *wait, unsigned mode, int sync, v
 	 * descriptor to be disabled. This condition is likely the effect of the
 	 * EPOLLONESHOT bit that disables the descriptor when an event is received,
 	 * until the next EPOLL_CTL_MOD will be issued.
-	 */
+	 */	
 	if (!(epi->event.events & ~EP_PRIVATE_BITS))
 		goto out_unlock;
 
@@ -1281,8 +1292,13 @@ static int ep_poll_callback(wait_queue_entry_t *wait, unsigned mode, int sync, v
 	 * semantics). All the events that happen during that period of time are
 	 * chained in ep->ovflist and requeued later on.
 	 */
+	// 如果ep->ovflist不是unactive的，说明正在往用户空间传输事件，
+	// 此时我们不能持有锁了，直接把事件链到ovflist上就行了
 	if (READ_ONCE(ep->ovflist) != EP_UNACTIVE_PTR) {
 		if (epi->next == EP_UNACTIVE_PTR) {
+			// 虽然目前的插入时LIFO的，但是之后读出的时候，会把它们反转成FIFO的、
+			// 所以这里不需要担心顺序问题了
+			// 头插
 			epi->next = READ_ONCE(ep->ovflist);
 			WRITE_ONCE(ep->ovflist, epi);
 			ep_pm_stay_awake_rcu(epi);
@@ -1831,6 +1847,9 @@ static int ep_send_events(struct eventpoll *ep,
 		if (epi->event.events & EPOLLONESHOT)
 			epi->event.events &= EP_PRIVATE_BITS;
 		else if (!(epi->event.events & EPOLLET)) {
+			// 水平触发会把事件重新入队，在下轮调用重新检查事件是否就绪
+			// 边缘触发则不会进入这个分支，事件就绪后就不会再入队了，
+			// 除非用户修改事件掩码重新注册或者调用EPOLL_CTL_MOD修改事件掩码
 			/*
 			 * If this file has been added with Level
 			 * Trigger mode, we need to insert back inside
